@@ -65,7 +65,9 @@ bool makeLightBar(const std::vector<cv::Point>& contour, LightBar& bar) {
     const cv::RotatedRect rectangle = cv::minAreaRect(contour);
     const float length = std::max(rectangle.size.width, rectangle.size.height);
     const float width = std::min(rectangle.size.width, rectangle.size.height);
-    if (width <= 0.0F || length < 18.0F || length / width < 2.5F) {
+    // 灯条偶尔会在二值图中变亮、变粗；保留长宽比至少 1.9 的区域，
+    // 后续仍由两灯条的相对位置排除不合理的组合。
+    if (width <= 0.0F || length < 18.0F || length / width < 1.9F) {
         return false;
     }
 
@@ -100,7 +102,9 @@ bool makeLightBar(const std::vector<cv::Point>& contour, LightBar& bar) {
 
 // 第八步：灯条配对。所有长度和间距都用平均灯条长度归一化，
 // 因而目标在画面里变大、变小时，阈值仍有相同的几何意义。
-std::vector<Armor> pairLightBars(const std::vector<LightBar>& bars) {
+std::vector<Armor> pairLightBars(const std::vector<LightBar>& bars,
+                                const cv::Mat& bright_pixels,
+                                float max_gap_ratio) {
     std::vector<Armor> candidates;
     for (std::size_t left = 0; left < bars.size(); ++left) {
         for (std::size_t right = left + 1; right < bars.size(); ++right) {
@@ -116,8 +120,49 @@ std::vector<Armor> pairLightBars(const std::vector<LightBar>& bars) {
             const float angle_difference =
                 std::abs(a.angle_degrees - b.angle_degrees);
 
-            if (length_ratio > 1.7F || gap_ratio < 1.0F || gap_ratio > 3.0F ||
-                height_difference > 0.5F || angle_difference > 20.0F) {
+            if (length_ratio > 1.7F || gap_ratio < 1.0F ||
+                gap_ratio > max_gap_ratio ||
+                height_difference > 0.5F || angle_difference > 25.0F) {
+                continue;
+            }
+
+            // 两根灯条之间如果已有一根同高度、相近长度的灯条，
+            // 当前组合很可能跨过了另一块装甲板，应当丢弃。
+            bool crosses_bar = false;
+            const float pair_center_y =
+                (a.rectangle.center.y + b.rectangle.center.y) / 2.0F;
+            for (std::size_t middle = left + 1; middle < right; ++middle) {
+                const LightBar& other = bars[middle];
+                if (std::abs(other.rectangle.center.y - pair_center_y) <=
+                        0.5F * mean_length &&
+                    other.length >= 0.5F * std::min(a.length, b.length)) {
+                    crosses_bar = true;
+                    break;
+                }
+            }
+            if (crosses_bar) {
+                continue;
+            }
+
+            // 只看两根灯条之间的内部区域，避开灯条本身：这两段素材的
+            // 真正装甲板中有浅色数字，而旁边的空支架通常很暗。
+            // 用亮像素比例排除“灯条 + 空支架”的误配，不需要识别数字几。
+            const float left_x = a.rectangle.center.x +
+                                 0.15F * (b.rectangle.center.x - a.rectangle.center.x);
+            const float right_x = b.rectangle.center.x -
+                                  0.15F * (b.rectangle.center.x - a.rectangle.center.x);
+            const int x1 = std::max(0, cvRound(left_x));
+            const int x2 = std::min(bright_pixels.cols, cvRound(right_x));
+            const int y1 = std::max(0, cvRound(pair_center_y - 0.45F * mean_length));
+            const int y2 = std::min(bright_pixels.rows,
+                                    cvRound(pair_center_y + 0.45F * mean_length));
+            if (x1 >= x2 || y1 >= y2) {
+                continue;
+            }
+            const cv::Rect interior(x1, y1, x2 - x1, y2 - y1);
+            const float bright_ratio = static_cast<float>(
+                cv::countNonZero(bright_pixels(interior))) / interior.area();
+            if (bright_ratio < 0.05F) {
                 continue;
             }
 
@@ -127,7 +172,7 @@ std::vector<Armor> pairLightBars(const std::vector<LightBar>& bars) {
             armor.score = std::abs(gap_ratio - 2.0F) +
                           0.8F * height_difference +
                           0.6F * (length_ratio - 1.0F) +
-                          0.03F * angle_difference;
+                          0.03F * angle_difference - 0.8F * bright_ratio;
             armor.corners = {a.top, b.top, b.bottom, a.bottom};
             candidates.push_back(armor);
         }
@@ -137,19 +182,18 @@ std::vector<Armor> pairLightBars(const std::vector<LightBar>& bars) {
         return a.score < b.score;
     });
 
-    // 同一根左灯条连接多个右灯条，或同一根右灯条连接多个左灯条时，
-    // 这些候选区域会套叠，只保留几何分数较好的一个。相邻装甲板可以
-    // 共用边界灯条：它在一组中是右灯条，在另一组中是左灯条。
-    std::vector<bool> used_as_left(bars.size(), false);
-    std::vector<bool> used_as_right(bars.size(), false);
+    // 每根灯条最多属于一块装甲板。按综合分数从小到大挑选时，
+    // 如果候选对中的任一根灯条已经被选中，就跳过这一对；
+    // 不论它在上一对中处于左侧还是右侧，都算已被占用。
+    std::vector<bool> used(bars.size(), false);
     std::vector<Armor> selected;
     for (const Armor& armor : candidates) {
-        if (used_as_left[armor.left] || used_as_right[armor.right]) {
+        if (used[armor.left] || used[armor.right]) {
             continue;
         }
         selected.push_back(armor);
-        used_as_left[armor.left] = true;
-        used_as_right[armor.right] = true;
+        used[armor.left] = true;
+        used[armor.right] = true;
     }
     return selected;
 }
@@ -158,58 +202,72 @@ FrameResult processFrame(const cv::Mat& frame) {
     FrameResult result;
     // 第零步：BGR 原图。OpenCV 读取的视频帧默认按蓝、绿、红排列；
     // 保留一份原图，方便与后续每个处理阶段直接对照。
-    result.stages[0] = frame.clone();
+    cv::Mat image_progress_bgr = frame.clone();
 
     // 第一步：滤波去噪。中值滤波用邻域的中间值替换孤立噪点，
     // 3×3 窗口较小，能尽量保留狭窄的蓝色灯条。
-    cv::medianBlur(frame, result.stages[1], 3);
+    cv::Mat image_progress_denoise;
+    cv::medianBlur(image_progress_bgr, image_progress_denoise, 3);
 
     // 第二步：亮度与颜色增强。先转到 HSV，把亮度 V 单独用 CLAHE
     // 做局部对比度增强；H（色相）和 S（饱和度）保持原样，便于找蓝色。
-    cv::Mat hsv;
-    cv::cvtColor(result.stages[1], hsv, cv::COLOR_BGR2HSV);
+    cv::Mat hsv_enhanced;
+    cv::cvtColor(image_progress_denoise, hsv_enhanced, cv::COLOR_BGR2HSV);
     std::vector<cv::Mat> hsv_channels;
-    cv::split(hsv, hsv_channels);
+    cv::split(hsv_enhanced, hsv_channels);
     cv::createCLAHE(2.0, cv::Size(8, 8))->apply(hsv_channels[2], hsv_channels[2]);
-    cv::merge(hsv_channels, hsv);
-    cv::cvtColor(hsv, result.stages[2], cv::COLOR_HSV2BGR);
+    cv::merge(hsv_channels, hsv_enhanced);
+    cv::Mat image_progress_enhance;
+    cv::cvtColor(hsv_enhanced, image_progress_enhance, cv::COLOR_HSV2BGR);
 
-    // 第三步：二值化。色相、饱和度和增强后的亮度先圈出蓝色；
-    // 再要求 B 比 R/G 至少亮 20，避免暗背景或灰白数字进入掩膜。
-    cv::Mat hsv_mask;
-    cv::inRange(hsv, cv::Scalar(90, 65, 120), cv::Scalar(135, 255, 255), hsv_mask);
+    // 第三步：二值化。参考 auto-aim-new 的颜色预处理思路，
+    // 直接分离蓝色和红色通道，再把它们合成为一个单通道颜色差异图。
+    // 灯条的目标颜色会在对应通道中更亮，灰白背景在两个通道中更接近，
+    // 因而用固定阈值即可得到干净的候选区域。
     std::vector<cv::Mat> bgr_channels;
-    cv::split(result.stages[1], bgr_channels);
-    cv::Mat max_red_green;
-    cv::max(bgr_channels[1], bgr_channels[2], max_red_green);
-    cv::Mat blue_contrast;
-    cv::subtract(bgr_channels[0], max_red_green, blue_contrast);
-    cv::Mat contrast_mask;
-    cv::threshold(blue_contrast, contrast_mask, 19, 255, cv::THRESH_BINARY);
-    cv::bitwise_and(hsv_mask, contrast_mask, result.stages[3]);
+    cv::split(image_progress_denoise, bgr_channels);
+    const cv::Mat& blue_channel = bgr_channels[0];
+    const cv::Mat& red_channel = bgr_channels[2];
+    cv::Mat red_blue_difference;
+    cv::absdiff(blue_channel, red_channel, red_blue_difference);
+    cv::Mat image_progress_binary;
+    cv::threshold(red_blue_difference, image_progress_binary, 40, 255,
+                  cv::THRESH_BINARY);
 
-    // 第四步：形态学处理。竖向闭运算连接灯条中的小断点；
-    // 随后的开运算删掉零散小亮点。核不能太大，否则相邻灯条会粘连。
-    cv::morphologyEx(result.stages[3], result.stages[4], cv::MORPH_CLOSE,
-                     cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 5)));
-    cv::morphologyEx(result.stages[4], result.stages[4], cv::MORPH_OPEN,
-                     cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3)));
+    // 第四步：形态学处理。闭运算等价于先膨胀、再腐蚀，能够连接
+    // 灯条内部的小断点；开运算等价于先腐蚀、再膨胀，用来删除小亮点。
+    // 这里把四步分别写出，方便新生观察 erode 和 dilate 的执行顺序。
+    const cv::Mat close_kernel =
+        cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 5));
+    cv::Mat image_progress_close_dilated;
+    cv::dilate(image_progress_binary, image_progress_close_dilated, close_kernel);
+    cv::Mat image_progress_closed;
+    cv::erode(image_progress_close_dilated, image_progress_closed, close_kernel);
+
+    const cv::Mat open_kernel =
+        cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3));
+    cv::Mat image_progress_open_eroded;
+    cv::erode(image_progress_closed, image_progress_open_eroded, open_kernel);
+    cv::Mat image_progress_morphology;
+    cv::dilate(image_progress_open_eroded, image_progress_morphology, open_kernel);
 
     // 第五步：轮廓提取。每个白色连通区域给出一条外轮廓；
     // 使用掩膜副本，保留原掩膜用于阶段图。
-    cv::Mat contour_input = result.stages[4].clone();
+    cv::Mat contour_input = image_progress_morphology.clone();
     std::vector<std::vector<cv::Point>> contours;
     cv::findContours(contour_input, contours, cv::RETR_EXTERNAL,
                      cv::CHAIN_APPROX_SIMPLE);
-    result.stages[5] = frame.clone();
-    cv::drawContours(result.stages[5], contours, -1, cv::Scalar(255, 255, 0), 1);
+    cv::Mat image_progress_contours = frame.clone();
+    cv::drawContours(image_progress_contours, contours, -1,
+                     cv::Scalar(255, 255, 0), 1);
 
     // 第六步：旋转矩形拟合。它同时描述区域的中心、长宽和方向，
     // 比水平包围框更适合略微倾斜的灯条。
-    result.stages[6] = frame.clone();
+    cv::Mat image_progress_rotated_rectangles = frame.clone();
     for (const auto& contour : contours) {
         if (cv::contourArea(contour) >= 15.0) {
-            drawRotatedRect(result.stages[6], cv::minAreaRect(contour),
+            drawRotatedRect(image_progress_rotated_rectangles,
+                            cv::minAreaRect(contour),
                             cv::Scalar(255, 255, 0), 1);
         }
     }
@@ -217,7 +275,7 @@ FrameResult processFrame(const cv::Mat& frame) {
     // 第七步：灯条几何筛选。只留下足够长、足够细、接近竖直的区域，
     // 并按照画面中的横坐标排序，为下一步左右配对做准备。
     std::vector<LightBar> bars;
-    result.stages[7] = frame.clone();
+    cv::Mat image_progress_light_bars = frame.clone();
     for (const auto& contour : contours) {
         LightBar bar;
         if (makeLightBar(contour, bar)) {
@@ -228,42 +286,69 @@ FrameResult processFrame(const cv::Mat& frame) {
         return a.rectangle.center.x < b.rectangle.center.x;
     });
     for (const LightBar& bar : bars) {
-        drawRotatedRect(result.stages[7], bar.rectangle, cv::Scalar(0, 255, 0));
+        drawRotatedRect(image_progress_light_bars, bar.rectangle,
+                        cv::Scalar(0, 255, 0));
     }
 
-    // 第八步：配对灯条。黄色线段连接通过长度、角度、位置检查的左右灯条。
-    const std::vector<Armor> armors = pairLightBars(bars);
-    result.stages[8] = result.stages[7].clone();
+    // 第八步：配对灯条。黄色线段连接通过几何和内部亮度检查的左右灯条。
+    // 先使用较严格的间距排除跨板误配。只有整帧一块都找不到时，
+    // 才稍微放宽间距，恢复二值图中灯条变粗的少数帧。
+    // 从原图提取亮像素；不用 CLAHE 增强图，避免把暗支架误判成白色数字。
+    cv::Mat bright_pixels;
+    cv::Mat gray;
+    cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
+    cv::threshold(gray, bright_pixels, 80, 255, cv::THRESH_BINARY);
+    std::vector<Armor> armors = pairLightBars(bars, bright_pixels, 2.5F);
+    if (armors.empty()) {
+        armors = pairLightBars(bars, bright_pixels, 2.6F);
+    }
+    cv::Mat image_progress_pairs = image_progress_light_bars.clone();
     for (const Armor& armor : armors) {
-        cv::line(result.stages[8], pixelPoint(bars[armor.left].rectangle.center),
+        cv::line(image_progress_pairs,
+                 pixelPoint(bars[armor.left].rectangle.center),
                  pixelPoint(bars[armor.right].rectangle.center),
                  cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
     }
 
     // 第九步：生成装甲板四角点。左右灯条长轴的上下端点给出
     // 近似四角；红点和绿色四边形是最终输出，不代表精确的三维角点。
-    result.annotated = frame.clone();
+    cv::Mat image_progress_armor_corners = frame.clone();
     for (std::size_t i = 0; i < armors.size(); ++i) {
         const Armor& armor = armors[i];
         for (int k = 0; k < 4; ++k) {
-            cv::line(result.annotated, pixelPoint(armor.corners[k]),
+            cv::line(image_progress_armor_corners, pixelPoint(armor.corners[k]),
                      pixelPoint(armor.corners[(k + 1) % 4]),
                      cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
-            cv::circle(result.annotated, pixelPoint(armor.corners[k]), 4,
+            cv::circle(image_progress_armor_corners, pixelPoint(armor.corners[k]), 4,
                        cv::Scalar(0, 0, 255), cv::FILLED, cv::LINE_AA);
         }
         const cv::Point label = pixelPoint(armor.corners[0]) + cv::Point(0, -8);
-        cv::putText(result.annotated, "Armor " + std::to_string(i + 1), label,
+        cv::putText(image_progress_armor_corners,
+                    "Armor " + std::to_string(i + 1), label,
                     cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 0), 2,
                     cv::LINE_AA);
     }
-    result.stages[9] = result.annotated;
+    result.annotated = image_progress_armor_corners;
+    result.stages = {image_progress_bgr, image_progress_denoise,
+                     image_progress_enhance, image_progress_binary,
+                     image_progress_morphology, image_progress_contours,
+                     image_progress_rotated_rectangles, image_progress_light_bars,
+                     image_progress_pairs, image_progress_armor_corners};
     result.armor_count = armors.size();
     return result;
 }
 
 // 教学阶段图采用英文短标签，因为 OpenCV 自带的 putText 不支持中文字符；
 // 每一步的中文说明放在上面的源码注释和 README 中。
+cv::Mat asBgr(const cv::Mat& stage) {
+    if (stage.channels() == 1) {
+        cv::Mat color;
+        cv::cvtColor(stage, color, cv::COLOR_GRAY2BGR);
+        return color;
+    }
+    return stage;
+}
+
 cv::Mat makeStageImage(const FrameResult& result) {
     constexpr int panel_width = 320;
     constexpr int panel_height = 180;
@@ -273,14 +358,9 @@ cv::Mat makeStageImage(const FrameResult& result) {
     cv::Mat montage(2 * panel_height, 5 * panel_width, CV_8UC3,
                     cv::Scalar(0, 0, 0));
     for (std::size_t i = 0; i < result.stages.size(); ++i) {
-        cv::Mat color;
-        if (result.stages[i].channels() == 1) {
-            cv::cvtColor(result.stages[i], color, cv::COLOR_GRAY2BGR);
-        } else {
-            color = result.stages[i];
-        }
         cv::Mat panel;
-        cv::resize(color, panel, cv::Size(panel_width, panel_height));
+        cv::resize(asBgr(result.stages[i]), panel,
+                   cv::Size(panel_width, panel_height));
         cv::rectangle(panel, cv::Rect(0, 0, panel_width, 26),
                       cv::Scalar(0, 0, 0), cv::FILLED);
         cv::putText(panel, labels[i], cv::Point(8, 19),
@@ -294,14 +374,24 @@ cv::Mat makeStageImage(const FrameResult& result) {
     return montage;
 }
 
-void saveStageImage(const FrameResult& result, const fs::path& directory,
+void saveStageImage(const cv::Mat& montage, const fs::path& directory,
                     int frame_index) {
     std::ostringstream filename;
     filename << "frame_" << std::setw(6) << std::setfill('0') << frame_index
              << ".png";
     const fs::path path = directory / filename.str();
-    if (!cv::imwrite(path.string(), makeStageImage(result))) {
+    if (!cv::imwrite(path.string(), montage)) {
         throw std::runtime_error("无法保存阶段图: " + path.string());
+    }
+}
+
+void openVideoWriter(cv::VideoWriter& writer, const fs::path& path,
+                     double fps, const cv::Size& size) {
+    // 直接用 OpenCV 写入 mp4v 编码的 MP4，帧率和尺寸由调用方传入。
+    writer.open(path.string(), cv::VideoWriter::fourcc('m', 'p', '4', 'v'),
+                fps, size, true);
+    if (!writer.isOpened()) {
+        throw std::runtime_error("无法创建视频: " + path.string());
     }
 }
 
@@ -327,51 +417,87 @@ int main(int argc, char** argv) {
         fs::create_directories(output_directory);
         const std::string stem = input_path.stem().string();
         const fs::path video_path = output_directory / (stem + "_annotated.mp4");
-        const fs::path stage_directory = output_directory / (stem + "_steps");
-        fs::create_directories(stage_directory);
+        const fs::path summary_path = output_directory / (stem + "_summary.mp4");
+        const fs::path stage_image_directory = output_directory / (stem + "_steps");
+        const fs::path stage_video_directory = output_directory / (stem + "_stages");
+        fs::create_directories(stage_image_directory);
+        fs::create_directories(stage_video_directory);
+
+        constexpr std::array<const char*, 8> stage_video_names = {
+            "01_denoise.mp4", "02_enhance.mp4", "03_binary.mp4",
+            "04_morphology.mp4", "05_contours.mp4", "06_rotated_rectangles.mp4",
+            "07_light_bars.mp4", "08_pairs.mp4"};
 
         double fps = capture.get(cv::CAP_PROP_FPS);
         if (!std::isfinite(fps) || fps <= 0.0) {
             fps = 30.0;
         }
-        cv::VideoWriter writer;
+        cv::VideoWriter annotated_writer;
+        cv::VideoWriter summary_writer;
+        std::array<cv::VideoWriter, 8> stage_writers;
         cv::Mat frame;
-        FrameResult last_result;
+        cv::Mat last_montage;
         int frame_index = 0;
         std::size_t total_armors = 0;
+        int detected_frames = 0;
         while (capture.read(frame)) {
             if (frame.empty()) {
                 throw std::runtime_error("视频中出现空帧");
             }
-            if (!writer.isOpened()) {
-                writer.open(video_path.string(), cv::VideoWriter::fourcc('m', 'p', '4', 'v'),
-                            fps, frame.size(), true);
-                if (!writer.isOpened()) {
-                    throw std::runtime_error("无法创建标注视频: " + video_path.string());
+
+            FrameResult result = processFrame(frame);
+            // 总结视频每一帧都包含 BGR 原图、八个中间状态和四角点结果。
+            // 阶段图和总结视频共用同一张拼图，避免重复缩放和绘制。
+            cv::Mat montage = makeStageImage(result);
+            if (!annotated_writer.isOpened()) {
+                openVideoWriter(annotated_writer, video_path, fps, frame.size());
+                openVideoWriter(summary_writer, summary_path, fps, montage.size());
+                for (std::size_t i = 0; i < stage_writers.size(); ++i) {
+                    openVideoWriter(stage_writers[i],
+                                    stage_video_directory / stage_video_names[i],
+                                    fps, frame.size());
                 }
             }
 
-            FrameResult result = processFrame(frame);
-            writer.write(result.annotated);
-            total_armors += result.armor_count;
-            if (frame_index % 30 == 0) {
-                saveStageImage(result, stage_directory, frame_index);
+            annotated_writer.write(result.annotated);
+            summary_writer.write(montage);
+            // 阶段 0 已是输入视频，阶段 9 已是标注视频；阶段 1–8
+            // 分别保存为独立视频。单通道掩膜转成 BGR 后再写入 MP4。
+            for (std::size_t i = 0; i < stage_writers.size(); ++i) {
+                stage_writers[i].write(asBgr(result.stages[i + 1]));
             }
-            last_result = std::move(result);
+            total_armors += result.armor_count;
+            if (result.armor_count > 0) {
+                ++detected_frames;
+            }
+            if (frame_index % 30 == 0) {
+                saveStageImage(montage, stage_image_directory, frame_index);
+            }
+            last_montage = std::move(montage);
             ++frame_index;
         }
         if (frame_index == 0) {
             throw std::runtime_error("视频没有可读取的帧");
         }
         if ((frame_index - 1) % 30 != 0) {
-            saveStageImage(last_result, stage_directory, frame_index - 1);
+            saveStageImage(last_montage, stage_image_directory, frame_index - 1);
         }
-        writer.release();
+        annotated_writer.release();
+        summary_writer.release();
+        for (auto& writer : stage_writers) {
+            writer.release();
+        }
         capture.release();
+
         std::cout << input_path.filename().string() << ": " << frame_index
                   << " 帧，检测到 " << total_armors << " 组装甲板（逐帧计数）\n"
+                  << "至少检出一组的帧: " << detected_frames << "/" << frame_index
+                  << " (" << std::fixed << std::setprecision(2)
+                  << 100.0 * detected_frames / frame_index << "%)\n"
                   << "标注视频: " << video_path << "\n"
-                  << "阶段图目录: " << stage_directory << '\n';
+                  << "总结视频: " << summary_path << "\n"
+                  << "中间阶段视频目录: " << stage_video_directory << "\n"
+                  << "阶段图目录: " << stage_image_directory << '\n';
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "错误: " << error.what() << '\n';
